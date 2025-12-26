@@ -1,0 +1,8 @@
+{
+  "name": "Voxtext",
+  "main_file": "voxtext_pyqt.py",
+  "description": "Imported from Voxtext",
+  "python_version": "3.11",
+  "created": "2025-12-23T06:53:00.713465",
+  "github_repo": "https://github.com/donburnsideAZ/voxtext.git"
+}
