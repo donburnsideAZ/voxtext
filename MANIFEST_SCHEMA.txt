@@ -1,0 +1,150 @@
+# Voxtext Translation Manifest -- Schema v2
+
+Contract between Voxtext (writer) and an automated translation flow
+(reader). Voxtext drops one per-video manifest next to each source video,
+and one job manifest per run into a watched cloud folder (the "Job
+manifest folder" in Options). The flow watches that folder, translates,
+and writes the finished `.vtt` back to the source folder -- no chat, no
+human in the loop.
+
+This is the shape tested and working against a live SharePoint/OneDrive +
+Power Automate flow (see `manifest.schema.json`, kept in sync with this
+doc). Earlier drafts used a different shape (`schema_version`, `video_id`,
+`source_language`, `target_language`, per-segment `text`); that shape is
+not supported. The flow's own Parse JSON step should be built against the
+fields below.
+
+For a friendlier walkthrough of turning the feature on and using it, see
+`TRANSLATION_MANIFEST_DELIVERY.md`.
+
+## File naming
+
+Per-video manifest: `<video_id>.manifest.json`, where `video_id` is the
+source video's filename stem (e.g. `01 - Welcome.mp4` ->
+`01 - Welcome.manifest.json`), written next to the source video and
+transcript -- never into the watched folder, so it can't self-trigger the
+flow.
+
+Job manifest: `<courseName>_<YYYYMMDD_HHMMSS>.job.manifest.json`, written
+into the Job manifest folder (set in Voxtext's Options) -- the only file
+Voxtext drops into the watched folder itself.
+
+Voxtext **delete-then-recreates** each manifest file on write rather than
+overwriting in place. SharePoint/OneDrive "file created" triggers can
+register an in-place overwrite as a *modification*, not a *creation* --
+silently skipping the flow. Delete+recreate guarantees a fresh creation
+event every time.
+
+## Per-video manifest fields
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `courseName` | string | yes | From the Translation Manifest panel's course/batch name field; falls back to the video's name if left blank. |
+| `sourceLanguage` | string | yes | Language code, e.g. `"en"`, as detected by Whisper. |
+| `targetLanguage` | string | yes | Language code, e.g. `"fr"`, picked in the Translation Manifest panel. |
+| `sourceFolder` | string | no* | SharePoint document-library-relative path (e.g. `/Shared Documents/Training/Onboarding`). The flow uses this as the destination folder for the translated file -- omitting it (or sending a raw local path) makes SharePoint-based flows fail with an empty-folder-path error. *Effectively required for a real run; only absent if Voxtext couldn't compute it (Base cloud folder not set in Options -- see below). |
+| `sourceFileName` | string | yes | The source-language VTT transcript Voxtext writes alongside the video: `<video_id>_transcript.vtt`. Voxtext always writes this file when manifests are on, even if VTT wasn't ticked in the output formats. |
+| `translatePrompt` | string | yes | Segment-tagged wire text -- one `[[id]] text` line per segment, newline-joined. In the source language. Despite the name, it holds no instructions, only the text. Pre-built by Voxtext; feed directly to the translator, no compose step needed in the flow. If the Context hint field in the Translation Manifest panel is filled in, a `Content context: <hint>` line plus a blank line is prepended before the tagged lines -- register/terminology guidance for the model, not tagged, never echoed back. Omitted entirely when the hint is blank. |
+| `segments` | array | yes | Never empty. Carries only `id`/`start`/`end` -- text lives in `translatePrompt`. |
+
+### `segments[]` entries
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | integer | 1-based, sequential. Matches the `[[id]]` tags in `translatePrompt`. Stable -- the translation pass tags on this id and must return every id unchanged. |
+| `start` | string | `HH:MM:SS.mmm`, zero-padded, `.` separator -- Voxtext's exact VTT timestamp format, ready to drop into the output cue as-is. |
+| `end` | string | Same format as `start`. |
+
+## Job manifest fields
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `courseName` | string | yes | Same value as the per-video manifests it groups. |
+| `sourceFolder` | string | no* | Same SharePoint-relative path as on the per-video manifests. The flow uses it to locate each per-video manifest. *Absent only if Voxtext couldn't compute it. |
+| `manifestFiles` | array of string | yes | Filenames (not paths) of the per-video manifests this run produced. The flow's outer loop iterates this list, one pass per video. |
+
+`sourceFolder` is on BOTH the per-video and job manifests -- the job
+manifest's copy is what the flow uses to go find each per-video manifest
+file, and each per-video manifest's own copy is what the flow uses as the
+destination folder for the translated output. Both are computed by
+Voxtext the same way (see `ai_processor.sharepoint_relative_path()`): the
+user sets a local "Base cloud folder" (the OneDrive-synced folder that
+mirrors the SharePoint library) and what that folder equals on
+SharePoint, in Options -- Translation Manifest Delivery. Voxtext then
+converts any local folder under that root into the matching
+SharePoint-relative path. A raw local Windows/Mac path here (instead of
+the converted SharePoint path) makes SharePoint-based flows fail.
+
+## Invariants (the flow must enforce these)
+
+1. **One segment in, one segment out.** The flow must never merge, split,
+   add, or drop segments. Output segment count == input segment count,
+   matched 1:1 by `id`. If it's skipped, captions silently drift out of
+   sync with the video.
+2. **Ids are never renumbered.** `[[7]]` in stays id `7` out.
+3. **Timing comes from the manifest, not the model.** `start`/`end` for
+   each output cue are copied verbatim from `segments[]` -- the
+   translation step only ever touches the text after each `[[id]]` tag.
+   This sidesteps any risk of an LLM "helpfully" adjusting timestamps.
+4. **`translatePrompt` is the only thing sent to the model.** Nothing
+   else in the manifest is translated or echoed into the output.
+
+## Example
+
+Per-video manifest:
+
+```json
+{
+  "courseName": "Onboarding Basics - Module 3",
+  "sourceLanguage": "en",
+  "targetLanguage": "fr",
+  "sourceFolder": "/Shared Documents/Training/Onboarding/Module 3",
+  "sourceFileName": "01 - Welcome_transcript.vtt",
+  "translatePrompt": "Content context: internal training video\n\n[[1]] Welcome to the team.\n[[2]] In this module we'll cover your first week.",
+  "segments": [
+    { "id": 1, "start": "00:00:00.000", "end": "00:00:02.800" },
+    { "id": 2, "start": "00:00:02.800", "end": "00:00:06.350" }
+  ]
+}
+```
+
+Matching job manifest:
+
+```json
+{
+  "courseName": "Onboarding Basics - Module 3",
+  "sourceFolder": "/Shared Documents/Training/Onboarding/Module 3",
+  "manifestFiles": [
+    "01 - Welcome.manifest.json",
+    "02 - Your First Week.manifest.json"
+  ]
+}
+```
+
+## How a flow can consume this (reference outline)
+
+1. **Trigger** -- "file created" on the Job manifest folder
+   (OneDrive/SharePoint connector, `.job.manifest.json` filter).
+2. **Get file content** -> parse the job manifest -> loop over
+   `manifestFiles`.
+3. **Get file content** for each per-video manifest, using the job
+   manifest's `sourceFolder` + the filename -> parse JSON.
+4. **Translate** -- send `translatePrompt` to your translator with
+   `targetLanguage`. Instructions: keep every `[[N]]` tag, don't
+   renumber, don't merge/split lines, translate only the text after each
+   tag. If present, the leading
+   `Content context: ...` line is guidance only -- a register/terminology
+   steer for the model, never a tagged line, never expected back in the
+   response.
+5. **Parse response** -- regex `^\[\[(\d+)\]\]\s*(.+)$` per line ->
+   `{id: translated_text}` map.
+6. **Guard** -- returned id set must exactly equal the manifest's
+   `segments[].id` set. If it doesn't, stop and flag rather than write a
+   broken caption file.
+7. **Build VTT** -- `WEBVTT` header, then per segment: `start --> end`
+   (copied verbatim from the manifest -- already Voxtext's exact
+   timestamp format, no conversion needed) followed by the translated
+   text and a blank line.
+8. **Create file** -- `<video_id>.<targetLanguage>.vtt`, written into
+   `sourceFolder` next to the source file. Skip if that file already
+   exists (idempotency, so a re-run doesn't touch finished work).

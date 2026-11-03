@@ -11,6 +11,7 @@ env/
 
 # TPC
 .tpc/snapshots/
+ffmpeg/
 
 # Build outputs
 dist/
@@ -32,3 +33,4 @@ Thumbs.db
 *.log
 *.sqlite
 *.db
+

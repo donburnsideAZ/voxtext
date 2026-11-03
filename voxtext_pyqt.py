@@ -23,6 +23,8 @@ import time
 import tempfile
 import webbrowser
 
+import ai_processor
+
 # ---------------------------------------------------------------------------
 # Windowed-build stdout/stderr guard  (fixes "'NoneType' has no attribute 'write'")
 # ---------------------------------------------------------------------------
@@ -38,6 +40,27 @@ for _stream in ("stdout", "stderr"):
             setattr(sys, _stream, open(os.devnull, "w"))
         except Exception:
             pass
+
+# ---------------------------------------------------------------------------
+# Windows: suppress the console window ffmpeg/whisper flash on screen
+# ---------------------------------------------------------------------------
+# --noconsole means Voxtext itself has no console — but Whisper shells out to
+# ffmpeg via subprocess for every file it loads, and Windows spawns a brand
+# new (visible) console for a child process whenever the parent has none and
+# doesn't say otherwise. That's the blank terminal window that flashes open
+# during transcription. Patching Popen to always pass CREATE_NO_WINDOW on
+# Windows fixes it for every subprocess call the app makes (ffmpeg, pip
+# during Install Whisper, etc.) without touching the whisper package itself.
+if sys.platform == "win32":
+    import subprocess as _subprocess
+    _CREATE_NO_WINDOW = 0x08000000  # subprocess.CREATE_NO_WINDOW
+    _orig_popen_init = _subprocess.Popen.__init__
+
+    def _no_window_popen_init(self, *args, **kwargs):
+        kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+        _orig_popen_init(self, *args, **kwargs)
+
+    _subprocess.Popen.__init__ = _no_window_popen_init
 
 # Ensure FFmpeg is on PATH before any Whisper usage.
 #
@@ -56,15 +79,26 @@ def _ensure_ffmpeg_on_path():
     try:
         candidate_dirs = []
 
-        # 1. Bundled ffmpeg/ next to script or in PyInstaller _MEIPASS
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            base = sys._MEIPASS
+        # 1. Bundled ffmpeg/ shipped with the app.
+        #    --onefile extracts to _MEIPASS; --onedir puts data next to the
+        #    exe inside _internal/. Probe both, plus the exe dir itself.
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            candidate_dirs.append(os.path.join(exe_dir, "ffmpeg"))
+            candidate_dirs.append(os.path.join(exe_dir, "_internal", "ffmpeg"))
+            candidate_dirs.append(exe_dir)
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidate_dirs.append(os.path.join(meipass, "ffmpeg"))
+                candidate_dirs.append(meipass)
         else:
             base = os.path.dirname(os.path.abspath(__file__))
-        candidate_dirs.append(os.path.join(base, "ffmpeg"))
+            candidate_dirs.append(os.path.join(base, "ffmpeg"))
 
         # 2. Common system install locations by platform
         system = platform.system()
+        home = os.path.expanduser("~")
+
         if system == "Darwin":
             candidate_dirs.extend([
                 "/opt/homebrew/bin",   # Apple Silicon Homebrew
@@ -72,16 +106,42 @@ def _ensure_ffmpeg_on_path():
                 "/opt/local/bin",      # MacPorts
             ])
         elif system == "Windows":
+            localappdata = os.environ.get(
+                "LOCALAPPDATA", os.path.join(home, "AppData", "Local")
+            )
+            programdata = os.environ.get("ProgramData", r"C:\ProgramData")
             candidate_dirs.extend([
                 r"C:\ffmpeg\bin",
                 r"C:\Program Files\ffmpeg\bin",
                 r"C:\Program Files (x86)\ffmpeg\bin",
+                # Chocolatey
+                os.path.join(programdata, "chocolatey", "bin"),
+                # Scoop — per-user and global
+                os.path.join(home, "scoop", "shims"),
+                os.path.join(home, "scoop", "apps", "ffmpeg", "current", "bin"),
+                r"C:\ProgramData\scoop\shims",
+                # winget shim directory
+                os.path.join(localappdata, "Microsoft", "WinGet", "Links"),
             ])
+            # winget unpacks FFmpeg into a versioned folder under Packages,
+            # e.g. ...\Packages\Gyan.FFmpeg_...\ffmpeg-7.1-full_build\bin
+            # The version string is unpredictable, so glob for it.
+            try:
+                import glob
+                pkg_root = os.path.join(localappdata, "Microsoft", "WinGet", "Packages")
+                if os.path.isdir(pkg_root):
+                    candidate_dirs.extend(
+                        glob.glob(os.path.join(pkg_root, "*FFmpeg*", "**", "bin"),
+                                  recursive=True)
+                    )
+            except Exception:
+                pass
         else:  # Linux and other Unix-likes
             candidate_dirs.extend([
                 "/usr/local/bin",
                 "/usr/bin",
                 "/snap/bin",
+                os.path.join(home, ".local", "bin"),
             ])
 
         ffmpeg_name = "ffmpeg.exe" if system == "Windows" else "ffmpeg"
@@ -119,7 +179,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QMessageBox, QButtonGroup, QFrame, QComboBox,
     QLineEdit, QTextEdit, QScrollArea, QDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent
 
 
@@ -233,22 +293,96 @@ def _start_dir():
     return get_setting("start_folder", "") or ""
 
 
+# ---------------------------------------------------------------------------
+# Live Whisper progress
+# ---------------------------------------------------------------------------
+# model.transcribe() has no progress callback, but inside whisper/transcribe.py
+# it drives a tqdm bar (total = audio frames, update() after every ~30s window)
+# whenever verbose=False. We temporarily swap that module's `tqdm` for a tiny
+# stand-in that reports frames-done / total back to the worker instead of
+# drawing to stderr. Any exception raised from update() propagates out of
+# transcribe(), which is how Cancel now stops a file mid-transcription.
+# If a future whisper release changes this internals, the swap is a no-op
+# and progress simply falls back to the old jump-at-the-end behaviour.
+class _WhisperCancelled(Exception):
+    """Raised from inside Whisper's loop when the user clicks Cancel."""
+
+
+class _whisper_progress:
+    def __init__(self, on_fraction, is_cancelled):
+        self.on_fraction  = on_fraction
+        self.is_cancelled = is_cancelled
+        self._module = None
+        self._orig   = None
+
+    def __enter__(self):
+        import importlib, types
+        try:
+            # import_module returns the submodule itself — `whisper.transcribe`
+            # as an attribute is the transcribe() function, not the module.
+            mod = importlib.import_module("whisper.transcribe")
+        except Exception:
+            return self
+        if not hasattr(mod, "tqdm"):
+            return self
+
+        on_fraction, is_cancelled = self.on_fraction, self.is_cancelled
+
+        class _Bar:
+            def __init__(self, *args, total=None, **kwargs):
+                self.total = total or 0
+                self.n = 0
+                self._t_last = time.monotonic()
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def update(self, n=1):
+                self.n += n
+                now = time.monotonic()
+                step_secs, self._t_last = now - self._t_last, now
+                if is_cancelled():
+                    raise _WhisperCancelled()
+                if self.total:
+                    # frac done, size of the step just taken (as a fraction),
+                    # and how long that step took — the UI uses the last two
+                    # to glide toward the next expected update.
+                    on_fraction(max(0.0, min(1.0, self.n / self.total)),
+                                n / self.total, step_secs)
+            def close(self):
+                pass
+
+        self._module = mod
+        self._orig   = mod.tqdm
+        mod.tqdm = types.SimpleNamespace(tqdm=_Bar)
+        return self
+
+    def __exit__(self, *exc):
+        if self._module is not None:
+            self._module.tqdm = self._orig
+        return False
+
+
 class TranscriptionWorker(QThread):
     """Worker thread for transcription to keep UI responsive"""
     progress = pyqtSignal(str, int)   # message, percentage
+    # Smoothing hint: "the next real update should land at <pct> in about
+    # <seconds>". The main window glides the bar toward it between updates.
+    progress_hint = pyqtSignal(float, float)
     finished = pyqtSignal(list)        # list of created files
     error    = pyqtSignal(str)         # error message
 
-    def __init__(self, file_path, model_name, output_formats, output_dir, lms_settings=None):
+    def __init__(self, file_path, model_name, output_formats, output_dir, lms_settings=None,
+                 manifest_settings=None):
         super().__init__()
-        self.file_path      = file_path
-        self.model_name     = model_name
-        self.output_formats = output_formats
-        self.output_dir     = output_dir
-        self.lms_settings   = lms_settings or {}
-        self.cancelled      = False
-        self.model          = None
-        self.result         = None   # retained for AI ops
+        self.file_path         = file_path
+        self.model_name        = model_name
+        self.output_formats    = output_formats
+        self.output_dir        = output_dir
+        self.lms_settings      = lms_settings or {}
+        self.manifest_settings = manifest_settings or {}
+        self.cancelled         = False
+        self.model             = None
 
     def run(self):
         try:
@@ -277,7 +411,7 @@ class TranscriptionWorker(QThread):
             if self.cancelled:
                 return
 
-            self.progress.emit(f"Loading {self.model_name} model (first time downloads)…", 5)
+            self.progress.emit(f"Loading {self.model_name} model…", 5)
             try:
                 self.model = whisper.load_model(self.model_name)
             except urllib.error.URLError as ssl_error:
@@ -291,7 +425,23 @@ class TranscriptionWorker(QThread):
                 return
 
             self.progress.emit("Model loaded. Transcribing audio…", 10)
-            result = self.model.transcribe(self.file_path, language="en", task="transcribe")
+            # language=None lets Whisper auto-detect the spoken language from
+            # the first ~30s of audio. Hardcoding "en" here was forcing every
+            # file to be decoded as English, which is why French (and other
+            # non-English) source audio was coming back as mangled English text.
+            # Map Whisper's 0..1 into the 10–80% band of the bar.
+            last_pct = [10]
+            def _on_fraction(frac, step, step_secs):
+                pct = 10 + int(frac * 70)
+                if pct != last_pct[0]:
+                    last_pct[0] = pct
+                    self.progress.emit("Transcribing audio…", pct)
+                if frac < 1.0:
+                    self.progress_hint.emit(10 + min(1.0, frac + step) * 70, step_secs)
+
+            with _whisper_progress(_on_fraction, lambda: self.cancelled):
+                result = self.model.transcribe(self.file_path, language=None,
+                                               task="transcribe", verbose=False)
 
             if self.cancelled:
                 return
@@ -329,26 +479,64 @@ class TranscriptionWorker(QThread):
                 current_progress += progress_per_format
                 self.progress.emit(f"Created {out.name}", int(current_progress))
 
+            if self.manifest_settings.get('enabled') and not self.cancelled:
+                try:
+                    manifest_path = self._write_manifest(result, base_path, self.output_dir)
+                    created_files.append(str(manifest_path))
+                    self.progress.emit(f"Created {manifest_path.name}", 97)
+                except Exception as manifest_exc:
+                    # A manifest problem shouldn't sink an otherwise-successful
+                    # transcription — surface it and keep the real outputs.
+                    self.progress.emit(f"Translation manifest failed: {manifest_exc}", 97)
+
             if not self.cancelled:
-                self.result = result
                 self.finished.emit(created_files)
+
+        except _WhisperCancelled:
+            return
 
         except FileNotFoundError as e:
             if not self.cancelled:
-                if 'ffmpeg' in str(e).lower():
-                    # Dump enough info to actually diagnose where we looked.
-                    import shutil as _shutil
-                    found = _shutil.which("ffmpeg") or "(not found on PATH)"
+                import shutil as _shutil
+
+                # Do NOT test for the word "ffmpeg" in the message — Windows
+                # raises this as:
+                #   [WinError 2] The system cannot find the file specified
+                # with no filename attached, because CreateProcess failed
+                # before one was recorded. Substring matching silently misses
+                # it and the user gets a bare WinError instead of this help.
+                #
+                # Identify it structurally instead: errno 2 (or winerror 2)
+                # plus ffmpeg being unresolvable on PATH. The source media
+                # file is known to exist — it was selected in the UI — so a
+                # missing-file error here can only be the executable.
+                found = _shutil.which("ffmpeg")
+                looks_like_missing_exe = (
+                    getattr(e, "winerror", None) == 2
+                    or e.errno == 2
+                    or "ffmpeg" in str(e).lower()
+                    or "ffmpeg" in str(getattr(e, "filename", "") or "").lower()
+                )
+
+                if found is None and looks_like_missing_exe:
                     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
                     path_preview = "\n  ".join(path_dirs) if path_dirs else "(empty)"
                     error_msg = (
-                        "FFmpeg not found!\n\n"
-                        "Whisper requires FFmpeg to process audio/video files.\n\n"
-                        "To install on Mac:\n  brew install ffmpeg\n\n"
-                        "To install on Windows:\n  Download from ffmpeg.org\n\n"
-                        "To install on Linux:\n  sudo apt install ffmpeg\n\n"
+                        "FFmpeg not found.\n\n"
+                        "Voxtext needs FFmpeg to read audio and video files. "
+                        "It isn't installed on this computer, or it isn't on "
+                        "the system PATH.\n\n"
+                        "Windows — pick one:\n"
+                        "  winget install Gyan.FFmpeg\n"
+                        "  choco install ffmpeg\n"
+                        "  or download from ffmpeg.org and unzip to C:\\ffmpeg\n\n"
+                        "Mac:\n  brew install ffmpeg\n\n"
+                        "Linux:\n  sudo apt install ffmpeg\n\n"
+                        "Quit and reopen Voxtext after installing so it picks "
+                        "up the updated PATH.\n\n"
                         "─── Diagnostic ───\n"
-                        f"shutil.which('ffmpeg'): {found}\n"
+                        "shutil.which('ffmpeg'): (not found on PATH)\n"
+                        f"Original error: {e}\n"
                         f"PATH searched:\n  {path_preview}"
                     )
                 else:
@@ -408,6 +596,191 @@ class TranscriptionWorker(QThread):
 
     def cancel(self):
         self.cancelled = True
+
+    def _write_manifest(self, result, base_path, out_dir):
+        """
+        Build and write one per-video translation manifest (see
+        ai_processor.build_translation_manifest / MANIFEST_SCHEMA.txt).
+        Shared by single-file and batch runs — base_path/out_dir are
+        passed explicitly since BatchTranscriptionWorker never sets
+        self.output_dir.
+        """
+        ms = self.manifest_settings
+        source_folder_sp = ai_processor.sharepoint_relative_path(
+            out_dir, ms.get('sync_root_local', ''), ms.get('sync_root_sp', '')
+        )
+        manifest = ai_processor.build_translation_manifest(
+            video_id=str(base_path),
+            course_name=(ms.get('course_name') or str(base_path)),
+            source_language=(result.get('language') or 'en'),
+            target_language=ms.get('target_lang', 'fr'),
+            segments=result.get('segments', []),
+            source_folder=source_folder_sp,
+            context_hint=ms.get('context', ''),
+        )
+        out = Path(out_dir) / f"{base_path}.manifest.json"
+        return ai_processor.write_manifest_file(manifest, out)
+
+
+class BatchTranscriptionWorker(TranscriptionWorker):
+    """
+    Batch version of TranscriptionWorker — transcribes every media file in a
+    list, loading the Whisper model ONCE rather than once per file. Reuses
+    the format-writing methods (_write_txt, _write_srt, etc.) unchanged, so
+    a fix to how any format is written applies to both single-file and
+    batch runs automatically, and output filenames match the single-file
+    worker exactly (e.g. "clip_transcript.vtt") so the two modes recognize
+    each other's output when skip-existing is on.
+
+    Per-file error isolation: one bad file is recorded as a failure and the
+    run continues — a corrupt file three files in shouldn't lose the other
+    fifty. Cancellation is checked between files (a file already mid-
+    transcribe finishes before the batch stops, same as Whisper's own
+    behaviour in the single-file worker).
+    """
+    file_finished  = pyqtSignal(str, list)   # filename, created file paths
+    file_failed    = pyqtSignal(str, str)    # filename, error message
+    batch_finished = pyqtSignal(list, list)  # done filenames, [(filename, error), ...]
+
+    OUTPUT_SUFFIXES = {
+        'txt': '_transcript.txt', 'srt': '_transcript.srt',
+        'vtt': '_transcript.vtt', 'html': '_transcript.html',
+        'md': '_transcript.md',   'json': '_transcript.json',
+    }
+
+    def __init__(self, file_paths, model_name, output_formats, lms_settings=None,
+                 skip_existing=True, manifest_settings=None):
+        # Parent __init__ wants a single file_path/output_dir — pass placeholders;
+        # run() is fully overridden below and never touches self.file_path/output_dir.
+        super().__init__(file_paths[0] if file_paths else "", model_name,
+                          output_formats, None, lms_settings, manifest_settings)
+        self.file_paths    = list(file_paths)
+        self.skip_existing = skip_existing
+
+    def _expected_outputs(self, media_path):
+        return [media_path.parent / f"{media_path.stem}{suffix}"
+                for fmt, suffix in self.OUTPUT_SUFFIXES.items()
+                if fmt in self.output_formats]
+
+    def _writer_for(self, fmt):
+        return {
+            'txt': self._write_txt, 'srt': self._write_srt,
+            'vtt': self._write_vtt, 'html': self._write_html,
+            'md': self._write_markdown, 'json': self._write_json,
+        }[fmt]
+
+    def run(self):
+        try:
+            import sys as _sys
+            import whisper as _whisper_mod
+            import ssl, urllib.error
+            if not hasattr(_whisper_mod, 'load_model'):
+                raise ImportError(
+                    "openai-whisper isn't loading correctly. Check Options for "
+                    "the same diagnostics shown on a single-file transcription."
+                )
+            whisper = _whisper_mod
+
+            if self.cancelled:
+                return
+
+            pending, skipped = [], 0
+            for fp in self.file_paths:
+                p = Path(fp)
+                if self.skip_existing and self._expected_outputs(p) and \
+                        all(o.exists() for o in self._expected_outputs(p)):
+                    skipped += 1
+                    continue
+                pending.append(p)
+
+            if not pending:
+                self.progress.emit(
+                    f"Nothing to do — all {skipped} file(s) already have output.", 100
+                )
+                self.batch_finished.emit([], [])
+                return
+
+            self.progress.emit(
+                f"Loading {self.model_name} model (once for the whole batch)…", 2
+            )
+            try:
+                self.model = whisper.load_model(self.model_name)
+            except urllib.error.URLError as ssl_error:
+                if "CERTIFICATE_VERIFY_FAILED" in str(ssl_error):
+                    ssl._create_default_https_context = ssl._create_unverified_context
+                    self.model = whisper.load_model(self.model_name)
+                else:
+                    raise
+
+            if self.cancelled:
+                return
+
+            done, failed = [], []
+            total = len(pending)
+
+            for i, media in enumerate(pending, start=1):
+                if self.cancelled:
+                    break
+
+                start_pct = 5 + int(((i - 1) / total) * 90)
+                self.progress.emit(f"[{i}/{total}] {media.name} — transcribing…", start_pct)
+
+                try:
+                    # Auto-detect language per file (see note in TranscriptionWorker.run)
+                    # Smooth progress within this file's slice of the bar,
+                    # leaving a little headroom for writing its outputs.
+                    end_pct  = 5 + int((i / total) * 90)
+                    span     = max(0, end_pct - start_pct - 1)
+                    last_pct = [start_pct]
+                    def _on_fraction(frac, step, step_secs, _i=i, _name=media.name,
+                                     _start=start_pct, _span=span, _last=last_pct):
+                        pct = _start + int(frac * _span)
+                        if pct != _last[0]:
+                            _last[0] = pct
+                            self.progress.emit(
+                                f"[{_i}/{total}] {_name} — transcribing… {int(frac * 100)}%", pct
+                            )
+                        if frac < 1.0:
+                            self.progress_hint.emit(
+                                _start + min(1.0, frac + step) * _span, step_secs
+                            )
+
+                    with _whisper_progress(_on_fraction, lambda: self.cancelled):
+                        result = self.model.transcribe(str(media), language=None,
+                                                       task="transcribe", verbose=False)
+                    created = []
+                    for fmt in self.output_formats:
+                        out = media.parent / f"{media.stem}{self.OUTPUT_SUFFIXES[fmt]}"
+                        self._writer_for(fmt)(result, out)
+                        created.append(str(out))
+                    if self.manifest_settings.get('enabled'):
+                        try:
+                            manifest_path = self._write_manifest(result, media.stem, media.parent)
+                            created.append(str(manifest_path))
+                        except Exception as manifest_exc:
+                            # One video's manifest failing shouldn't fail the video's
+                            # own transcription outputs, or the rest of the batch.
+                            self.progress.emit(
+                                f"[{i}/{total}] {media.name} — translation manifest failed: {manifest_exc}",
+                                start_pct
+                            )
+                    done.append(media.name)
+                    self.file_finished.emit(media.name, created)
+                    self.progress.emit(f"[{i}/{total}] {media.name} — done",
+                                        5 + int((i / total) * 90))
+                except _WhisperCancelled:
+                    break
+                except Exception as exc:
+                    failed.append((media.name, str(exc)))
+                    self.file_failed.emit(media.name, str(exc))
+
+            if not self.cancelled:
+                self.progress.emit("Batch complete.", 100)
+                self.batch_finished.emit(done, failed)
+
+        except Exception as e:
+            if not self.cancelled:
+                self.error.emit(str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +844,82 @@ class VoxtextOptionsDialog(QDialog):
         row.addWidget(self._ghost("Clear", self.folder_edit.clear, width=80))
         lay.addLayout(row)
 
+        # — Translation Manifest Delivery (off by default — a power-user
+        # feature for teams running an automated translation flow, not
+        # something every Voxtext user should see) —
+        lay.addWidget(self._section("TRANSLATION MANIFEST DELIVERY"))
+        tmd_desc = QLabel(
+            "Off by default. Turn this on only if you have an automated "
+            "translation flow (e.g. a Power Automate workflow) "
+            "watching a cloud folder for Voxtext's manifest files."
+        )
+        tmd_desc.setFont(self.win.f_body)
+        tmd_desc.setWordWrap(True)
+        tmd_desc.setStyleSheet(f"color: {COLORS['text_muted']}; border: none;")
+        lay.addWidget(tmd_desc)
+
+        self.manifest_delivery_enabled = QCheckBox("Enable Translation Manifest Delivery")
+        self.manifest_delivery_enabled.setFont(self.win.f_body)
+        self.manifest_delivery_enabled.setStyleSheet(self.win._checkbox_style())
+        self.manifest_delivery_enabled.setChecked(
+            bool(get_setting("translation_manifest_feature_enabled", False))
+        )
+        self.manifest_delivery_enabled.stateChanged.connect(self._toggle_manifest_delivery_rows)
+        lay.addWidget(self.manifest_delivery_enabled)
+
+        jm_lbl = QLabel("Job manifest folder \u2014 the watched cloud folder the flow triggers on:")
+        jm_lbl.setFont(self.win.f_label)
+        jm_lbl.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
+        lay.addWidget(jm_lbl)
+
+        tq_row = QHBoxLayout()
+        tq_row.setSpacing(8)
+        self.queue_folder_edit = QLineEdit(get_setting("translation_queue_folder", "") or "")
+        self.queue_folder_edit.setFont(self.win.f_body)
+        self.queue_folder_edit.setStyleSheet(self.win._input_style())
+        self.queue_folder_edit.setPlaceholderText("Not set \u2014 job manifests won't be sent")
+        tq_row.addWidget(self.queue_folder_edit, 1)
+        self._queue_browse_btn = self._ghost("Browse\u2026", self._browse_queue_folder, width=110)
+        self._queue_clear_btn = self._ghost("Clear", self.queue_folder_edit.clear, width=80)
+        tq_row.addWidget(self._queue_browse_btn)
+        tq_row.addWidget(self._queue_clear_btn)
+        lay.addLayout(tq_row)
+
+        sr_lbl = QLabel(
+            "Base cloud folder \u2014 the local folder that mirrors your SharePoint "
+            "library (e.g. your OneDrive-synced site folder):"
+        )
+        sr_lbl.setFont(self.win.f_label)
+        sr_lbl.setWordWrap(True)
+        sr_lbl.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
+        lay.addWidget(sr_lbl)
+
+        sr_row = QHBoxLayout()
+        sr_row.setSpacing(8)
+        self.sync_root_local_edit = QLineEdit(get_setting("sharepoint_sync_root_local", "") or "")
+        self.sync_root_local_edit.setFont(self.win.f_body)
+        self.sync_root_local_edit.setStyleSheet(self.win._input_style())
+        self.sync_root_local_edit.setPlaceholderText("Not set \u2014 sourceFolder won't be sent")
+        sr_row.addWidget(self.sync_root_local_edit, 1)
+        self._sync_root_browse_btn = self._ghost("Browse\u2026", self._browse_sync_root, width=110)
+        self._sync_root_clear_btn = self._ghost("Clear", self.sync_root_local_edit.clear, width=80)
+        sr_row.addWidget(self._sync_root_browse_btn)
+        sr_row.addWidget(self._sync_root_clear_btn)
+        lay.addLayout(sr_row)
+
+        sp_lbl = QLabel("Its SharePoint path \u2014 what that folder equals on SharePoint:")
+        sp_lbl.setFont(self.win.f_label)
+        sp_lbl.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
+        lay.addWidget(sp_lbl)
+
+        self.sync_root_sp_edit = QLineEdit(get_setting("sharepoint_sync_root_path", "") or "")
+        self.sync_root_sp_edit.setFont(self.win.f_body)
+        self.sync_root_sp_edit.setStyleSheet(self.win._input_style())
+        self.sync_root_sp_edit.setPlaceholderText("e.g. /Shared Documents/Training")
+        lay.addWidget(self.sync_root_sp_edit)
+
+        self._toggle_manifest_delivery_rows(self.manifest_delivery_enabled.checkState().value)
+
         # — Models —
         lay.addWidget(self._section("MODELS"))
         mrow = QHBoxLayout()
@@ -519,8 +968,31 @@ class VoxtextOptionsDialog(QDialog):
         if d:
             self.folder_edit.setText(d)
 
+    def _browse_queue_folder(self):
+        start = self.queue_folder_edit.text().strip() or _start_dir()
+        d = QFileDialog.getExistingDirectory(self, "Select Job Manifest Folder", start)
+        if d:
+            self.queue_folder_edit.setText(d)
+
+    def _browse_sync_root(self):
+        start = self.sync_root_local_edit.text().strip() or _start_dir()
+        d = QFileDialog.getExistingDirectory(self, "Select Base Cloud Folder", start)
+        if d:
+            self.sync_root_local_edit.setText(d)
+
+    def _toggle_manifest_delivery_rows(self, state):
+        enabled = state == Qt.CheckState.Checked.value
+        for w in (self.queue_folder_edit, self._queue_browse_btn, self._queue_clear_btn,
+                  self.sync_root_local_edit, self._sync_root_browse_btn, self._sync_root_clear_btn,
+                  self.sync_root_sp_edit):
+            w.setEnabled(enabled)
+
     def _save(self):
         set_setting("start_folder", self.folder_edit.text().strip())
+        set_setting("translation_manifest_feature_enabled", self.manifest_delivery_enabled.isChecked())
+        set_setting("translation_queue_folder", self.queue_folder_edit.text().strip())
+        set_setting("sharepoint_sync_root_local", self.sync_root_local_edit.text().strip())
+        set_setting("sharepoint_sync_root_path", self.sync_root_sp_edit.text().strip())
         self.accept()
 
 
@@ -534,9 +1006,11 @@ class VoxtextWindow(QMainWindow):
         super().__init__()
         self.selected_file  = None
         self.worker         = None
-        self.last_result    = None
         self.start_time     = None
         self.timer_id       = None
+        self.batch_files    = []   # queued paths when in batch (folder) mode
+        self.batch_folder_path = None       # source folder when batch came from a folder
+        self._batch_manifest_files = []     # per-video manifest.json paths from the last batch run
 
         self.vtt_presets = {
             'Custom':        {'cue_settings': '',          'css': ''},
@@ -574,7 +1048,7 @@ class VoxtextWindow(QMainWindow):
         self.f_bold  = QFont("SF Pro Display", 13, QFont.Weight.Bold)
         self.f_small = QFont("SF Pro Display", 13)   # same size, no more tiny text
         self.f_label = QFont("SF Pro Display", 13, QFont.Weight.DemiBold)
-        self.f_title = QFont("SF Pro Display", 22, QFont.Weight.Bold)
+        self.f_title = QFont("SF Pro Display", 18, QFont.Weight.DemiBold)
         self.f_sec   = QFont("SF Pro Display", 11, QFont.Weight.DemiBold)  # section headers only
 
         # Keyboard shortcuts (menu bar removed — preserve muscle memory)
@@ -616,40 +1090,38 @@ class VoxtextWindow(QMainWindow):
 
         header.addLayout(id_col, 1)
 
-        # Right: chrome (Options, About) stacked ABOVE Browse
-        hdr_right = QVBoxLayout()
+        # Right: Batch, Browse, Options, About — one row (matches VoxPrep)
+        hdr_right = QHBoxLayout()
         hdr_right.setSpacing(8)
+        hdr_right.addStretch()
 
-        chrome_row = QHBoxLayout()
-        chrome_row.setSpacing(8)
-        chrome_row.addStretch()
+        self.batch_btn = QPushButton("Batch Folder\u2026")
+        self.batch_btn.setFont(self.f_body)
+        self.batch_btn.setStyleSheet(self._btn_secondary())
+        self.batch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.batch_btn.clicked.connect(self.browse_batch_folder)
+        hdr_right.addWidget(self.batch_btn)
+
+        self.browse_btn = QPushButton("Browse\u2026")
+        self.browse_btn.setFont(self.f_body)
+        self.browse_btn.setStyleSheet(self._btn_secondary())
+        self.browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.browse_btn.clicked.connect(self.browse_file)
+        hdr_right.addWidget(self.browse_btn)
 
         self.options_btn = QPushButton("\u2699  Options")
         self.options_btn.setFont(self.f_body)
         self.options_btn.setStyleSheet(self._btn_chrome())
         self.options_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.options_btn.clicked.connect(self.open_options)
-        chrome_row.addWidget(self.options_btn)
+        hdr_right.addWidget(self.options_btn)
 
         self.about_btn = QPushButton("About")
         self.about_btn.setFont(self.f_body)
         self.about_btn.setStyleSheet(self._btn_chrome())
         self.about_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.about_btn.clicked.connect(self.show_about)
-        chrome_row.addWidget(self.about_btn)
-
-        hdr_right.addLayout(chrome_row)
-
-        browse_row = QHBoxLayout()
-        browse_row.addStretch()
-        self.browse_btn = QPushButton("Browse\u2026")
-        self.browse_btn.setFont(self.f_body)
-        self.browse_btn.setStyleSheet(self._btn_secondary())
-        self.browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.browse_btn.setFixedWidth(130)
-        self.browse_btn.clicked.connect(self.browse_file)
-        browse_row.addWidget(self.browse_btn)
-        hdr_right.addLayout(browse_row)
+        hdr_right.addWidget(self.about_btn)
 
         header.addLayout(hdr_right)
         root.addLayout(header)
@@ -659,6 +1131,39 @@ class VoxtextWindow(QMainWindow):
         divider.setFixedHeight(1)
         divider.setStyleSheet(f"background-color: {COLORS['border']}; border: none;")
         root.addWidget(divider)
+
+        # ── Batch bar (hidden until a folder / multiple files are queued) ────
+        self.batch_bar = QFrame()
+        self.batch_bar.setStyleSheet(f"""
+            background-color: {COLORS['info_bg']};
+            border: 1px solid {COLORS['info_border']};
+            border-radius: 6px;
+        """)
+        batch_bar_layout = QHBoxLayout(self.batch_bar)
+        batch_bar_layout.setContentsMargins(12, 8, 12, 8)
+        batch_bar_layout.setSpacing(10)
+
+        self.batch_info_label = QLabel("")
+        self.batch_info_label.setFont(self.f_body)
+        self.batch_info_label.setStyleSheet(f"color: {COLORS['info_text']}; border: none;")
+        self.batch_info_label.setWordWrap(True)
+        batch_bar_layout.addWidget(self.batch_info_label, 1)
+
+        self.batch_skip_existing = QCheckBox("Skip files that already have output")
+        self.batch_skip_existing.setFont(self.f_body)
+        self.batch_skip_existing.setStyleSheet(self._checkbox_style())
+        self.batch_skip_existing.setChecked(True)
+        batch_bar_layout.addWidget(self.batch_skip_existing)
+
+        self.batch_clear_btn = QPushButton("Clear batch")
+        self.batch_clear_btn.setFont(self.f_body)
+        self.batch_clear_btn.setStyleSheet(self._btn_secondary())
+        self.batch_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.batch_clear_btn.clicked.connect(self.clear_batch)
+        batch_bar_layout.addWidget(self.batch_clear_btn)
+
+        self.batch_bar.setVisible(False)
+        root.addWidget(self.batch_bar)
 
         # ── Whisper warning (full width, conditional) ───────────────────────
         self.warn_label = QLabel("\u26a0  Whisper not installed \u2014 use 'Install Whisper' below to get started.")
@@ -674,7 +1179,7 @@ class VoxtextWindow(QMainWindow):
         self.warn_label.setVisible(not WHISPER_AVAILABLE)
         root.addWidget(self.warn_label)
 
-        # ── Body (scrollable): Model+Formats row, then full-width AI band ────
+        # ── Body (scrollable): Model+Formats row, then full-width manifest band ────
         # Wrapping the middle in a scroll area means the window keeps a fixed
         # landscape size; content scrolls only when it overflows (VTT+LMS open).
         scroll = QScrollArea()
@@ -703,12 +1208,12 @@ class VoxtextWindow(QMainWindow):
 
         self.model_group = QButtonGroup(self)
         models = [
-            ('small',  '466 MB', 'Good quality'),
-            ('medium', '1.5 GB', 'Professional quality'),
-            ('large',  '3 GB',   'Maximum accuracy'),
+            ('small',  'Good quality'),
+            ('medium', 'Professional quality'),
+            ('large',  'Maximum accuracy'),
         ]
-        for name, size, quality in models:
-            rb = QRadioButton(f"{name.capitalize()}  ({size})")
+        for name, quality in models:
+            rb = QRadioButton(name.capitalize())
             rb.setFont(self.f_body)
             rb.setStyleSheet(self._radio_style())
             rb.setProperty("model_name", name)
@@ -773,101 +1278,6 @@ class VoxtextWindow(QMainWindow):
         top_row.addLayout(col1, 1)
         top_row.addLayout(col2, 1)
         body.addLayout(top_row)
-
-        # — Full-width AI Processing band (three actions, side by side) ───────
-        ai_card   = self._make_card()
-        ai_layout = QVBoxLayout(ai_card)
-        ai_layout.setContentsMargins(16, 14, 16, 16)
-        ai_layout.setSpacing(10)
-
-        ai_layout.addWidget(self._section_header("AI PROCESSING"))
-
-        self.ai_note = QLabel("\u2726  Transcribe a file first to enable AI operations")
-        self.ai_note.setFont(self.f_body)
-        self.ai_note.setStyleSheet(f"""
-            color: {COLORS['info_text']};
-            background-color: {COLORS['info_bg']};
-            border: 1px solid {COLORS['info_border']};
-            border-radius: 6px;
-            padding: 8px 12px;
-        """)
-        self.ai_note.setWordWrap(True)
-        ai_layout.addWidget(self.ai_note)
-
-        def _ai_heading(text):
-            l = QLabel(text); l.setFont(self.f_label)
-            l.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
-            return l
-
-        def _ai_desc(text):
-            l = QLabel(text); l.setFont(self.f_body); l.setWordWrap(True)
-            l.setStyleSheet(f"color: {COLORS['text_muted']}; border: none;")
-            return l
-
-        def _vline():
-            v = QFrame(); v.setFrameShape(QFrame.Shape.VLine)
-            v.setStyleSheet(f"border: none; border-left: 1px solid {COLORS['border']};")
-            v.setFixedWidth(1)
-            return v
-
-        ai_cols = QHBoxLayout()
-        ai_cols.setSpacing(20)
-
-        # Sub-column 1: Format transcript
-        c1 = QVBoxLayout(); c1.setSpacing(6)
-        c1.addWidget(_ai_heading("Format transcript"))
-        c1.addWidget(_ai_desc("Improve readability of the raw text."))
-        self.format_ai_btn = QPushButton("Clean Up Transcript\u2026")
-        self.format_ai_btn.setFont(self.f_bold)
-        self.format_ai_btn.setEnabled(False)
-        self.format_ai_btn.setStyleSheet(self._btn_blue())
-        self.format_ai_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.format_ai_btn.clicked.connect(lambda: self.open_ai_dialog("format"))
-        c1.addWidget(self.format_ai_btn)
-        c1.addStretch()
-
-        # Sub-column 2: Translate transcript
-        c2 = QVBoxLayout(); c2.setSpacing(6)
-        c2.addWidget(_ai_heading("Translate transcript"))
-        c2.addWidget(_ai_desc("Translate to another language, preserving segment timing. Delivers a WebVTT file."))
-        lang_row = QHBoxLayout(); lang_row.setSpacing(8)
-        from ai_processor import LANGUAGES
-        self.ai_lang_combo = QComboBox()
-        self.ai_lang_combo.setFont(self.f_body)
-        self.ai_lang_combo.setStyleSheet(self._combo_style())
-        for code, name in LANGUAGES.items():
-            self.ai_lang_combo.addItem(name, code)
-        lang_row.addWidget(self.ai_lang_combo, 1)
-        self.translate_btn = QPushButton("Translate\u2026")
-        self.translate_btn.setFont(self.f_bold)
-        self.translate_btn.setEnabled(False)
-        self.translate_btn.setStyleSheet(self._btn_blue())
-        self.translate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.translate_btn.clicked.connect(lambda: self.open_ai_dialog("translate"))
-        lang_row.addWidget(self.translate_btn)
-        c2.addLayout(lang_row)
-        c2.addStretch()
-
-        # Sub-column 3: Translate an existing VTT
-        c3 = QVBoxLayout(); c3.setSpacing(6)
-        c3.addWidget(_ai_heading("Translate a VTT file"))
-        c3.addWidget(_ai_desc("Translate an existing WebVTT file you created manually."))
-        self.translate_vtt_btn = QPushButton("Translate VTT File\u2026")
-        self.translate_vtt_btn.setFont(self.f_bold)
-        self.translate_vtt_btn.setStyleSheet(self._btn_blue())
-        self.translate_vtt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.translate_vtt_btn.clicked.connect(self.translate_vtt_file)
-        c3.addWidget(self.translate_vtt_btn)
-        c3.addStretch()
-
-        ai_cols.addLayout(c1, 1)
-        ai_cols.addWidget(_vline())
-        ai_cols.addLayout(c2, 1)
-        ai_cols.addWidget(_vline())
-        ai_cols.addLayout(c3, 1)
-        ai_layout.addLayout(ai_cols)
-
-        body.addWidget(ai_card)
 
         scroll.setWidget(body_widget)
         root.addWidget(scroll, 1)
@@ -936,7 +1346,86 @@ class VoxtextWindow(QMainWindow):
         self.lms_options.setVisible(False)
         lms_layout.addWidget(self.lms_options)
 
+        # — Translation Manifest (full-width; hidden unless enabled in
+        # Options — Translation Manifest Delivery, since this is a
+        # power-user feature for teams running an automated translation
+        # flow, not something every Voxtext user should see) —
+        self.manifest_panel = self._make_card()
+        manifest_layout = QVBoxLayout(self.manifest_panel)
+        manifest_layout.setContentsMargins(16, 14, 16, 14)
+        manifest_layout.setSpacing(6)
+
+        manifest_layout.addWidget(self._section_header("TRANSLATION MANIFEST"))
+
+        manifest_hdr = QHBoxLayout()
+        self.manifest_enabled = QCheckBox("Generate Translation Manifest")
+        self.manifest_enabled.setFont(self.f_body)
+        self.manifest_enabled.setStyleSheet(self._checkbox_style())
+        self.manifest_enabled.stateChanged.connect(self.toggle_manifest_options)
+        manifest_hdr.addWidget(self.manifest_enabled)
+
+        target_lbl = QLabel("Target language:")
+        target_lbl.setFont(self.f_label)
+        target_lbl.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
+        manifest_hdr.addWidget(target_lbl)
+
+        self.manifest_lang_combo = QComboBox()
+        self.manifest_lang_combo.setFont(self.f_body)
+        self.manifest_lang_combo.setMinimumWidth(170)
+        self.manifest_lang_combo.setStyleSheet(self._combo_style())
+        for code, name in ai_processor.LANGUAGES.items():
+            self.manifest_lang_combo.addItem(name, code)
+        manifest_hdr.addWidget(self.manifest_lang_combo)
+        manifest_hdr.addStretch()
+        manifest_layout.addLayout(manifest_hdr)
+
+        self.manifest_options = QWidget()
+        self.manifest_options.setStyleSheet("background: transparent;")
+        mopts_layout = QVBoxLayout(self.manifest_options)
+        mopts_layout.setContentsMargins(0, 4, 0, 0)
+        mopts_layout.setSpacing(6)
+
+        course_row = QHBoxLayout()
+        course_lbl = QLabel("Course / batch name:")
+        course_lbl.setFont(self.f_label)
+        course_lbl.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
+        course_row.addWidget(course_lbl)
+        self.manifest_course = QLineEdit()
+        self.manifest_course.setFont(self.f_body)
+        self.manifest_course.setStyleSheet(self._input_style())
+        self.manifest_course.setPlaceholderText("Names the job manifest — defaults to the source folder name")
+        course_row.addWidget(self.manifest_course)
+        mopts_layout.addLayout(course_row)
+
+        context_row = QHBoxLayout()
+        context_lbl = QLabel("Context hint:")
+        context_lbl.setFont(self.f_label)
+        context_lbl.setStyleSheet(f"color: {COLORS['text_tertiary']}; border: none;")
+        context_row.addWidget(context_lbl)
+        self.manifest_context = QLineEdit()
+        self.manifest_context.setFont(self.f_body)
+        self.manifest_context.setStyleSheet(self._input_style())
+        self.manifest_context.setPlaceholderText('Optional — e.g. "compliance training video" (register/terminology only)')
+        context_row.addWidget(self.manifest_context)
+        mopts_layout.addLayout(context_row)
+
+        manifest_hint = QLabel(
+            "Writes one <video>.manifest.json next to each source file, plus one "
+            "job manifest in your Job Manifest Folder (set in Options) that "
+            "kicks off your automated translation flow."
+        )
+        manifest_hint.setFont(self.f_small)
+        manifest_hint.setWordWrap(True)
+        manifest_hint.setStyleSheet(f"color: {COLORS['text_muted']}; border: none; margin-top: 2px;")
+        mopts_layout.addWidget(manifest_hint)
+
+        self.manifest_options.setVisible(False)
+        manifest_layout.addWidget(self.manifest_options)
+
+        self.manifest_panel.setVisible(bool(get_setting("translation_manifest_feature_enabled", False)))
+
         self._body_layout.addWidget(self.lms_panel)
+        self._body_layout.addWidget(self.manifest_panel)
         self._body_layout.addStretch()
 
         # Connect VTT toggle
@@ -953,7 +1442,9 @@ class VoxtextWindow(QMainWindow):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(100)
+        # 0–1000 internally so the smoothing glide moves in sub-percent
+        # steps; everything else talks in 0–100 via _set_progress().
+        self.progress_bar.setMaximum(1000)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setFixedHeight(8)
@@ -975,6 +1466,18 @@ class VoxtextWindow(QMainWindow):
         self.progress_label.setStyleSheet(f"color: {COLORS['text']}; border: none;")
         self.progress_label.setFixedWidth(44)
         prog_row.addWidget(self.progress_label)
+
+        # Smooth progress: real updates from Whisper arrive once per ~30s
+        # chunk. Between them this timer eases the bar toward where the next
+        # update is expected, always stopping short of it, so the bar never
+        # runs ahead of real work and never moves backwards.
+        self._prog_display = 0.0     # what the bar shows (0–100, float)
+        self._prog_real    = 0.0     # last real value from the worker
+        self._prog_target  = None    # expected next real value, or None
+        self._prog_tau     = 1.0     # easing time constant (seconds)
+        self._prog_timer   = QTimer(self)
+        self._prog_timer.setInterval(50)
+        self._prog_timer.timeout.connect(self._tick_progress)
 
         root.addLayout(prog_row)
 
@@ -1209,10 +1712,25 @@ class VoxtextWindow(QMainWindow):
 
     def dropEvent(self, event: QDropEvent):
         urls = event.mimeData().urls()
-        if urls:
-            fp = urls[0].toLocalFile()
-            if os.path.isfile(fp):
-                self._load_file(fp)
+        if not urls:
+            return
+        paths = [u.toLocalFile() for u in urls]
+
+        # A single folder dropped -> scan it and queue a batch
+        if len(paths) == 1 and os.path.isdir(paths[0]):
+            self._load_batch_folder(paths[0])
+            return
+
+        files = [p for p in paths if os.path.isfile(p)]
+
+        # Multiple files dropped at once -> batch those exact files
+        if len(files) > 1:
+            self._load_batch_files(files, source_label=f"{len(files)} dropped files")
+            return
+
+        # A single file -> existing single-file flow, unchanged
+        if files:
+            self._load_file(files[0])
 
     # -----------------------------------------------------------------------
     # File selection
@@ -1231,9 +1749,70 @@ class VoxtextWindow(QMainWindow):
             self._load_file(fp)
 
     def _load_file(self, fp):
+        self.clear_batch(silent=True)
         self.selected_file = fp
         self._set_file_header(fp)
         self.status_label.setText("File loaded. Ready to transcribe.")
+        if not self.manifest_course.text().strip():
+            self.manifest_course.setText(Path(fp).parent.name)
+
+    # -----------------------------------------------------------------------
+    # Batch (folder) selection
+    # -----------------------------------------------------------------------
+    def browse_batch_folder(self):
+        if self.worker and self.worker.isRunning():
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select a Folder of Audio/Video Files", _start_dir()
+        )
+        if folder:
+            self._load_batch_folder(folder)
+
+    def _scan_media_files(self, folder):
+        exts = self.audio_extensions | self.video_extensions
+        found = []
+        for name in sorted(os.listdir(folder)):
+            fp = os.path.join(folder, name)
+            if os.path.isfile(fp) and Path(fp).suffix.lower() in exts:
+                found.append(fp)
+        return found
+
+    def _load_batch_folder(self, folder):
+        files = self._scan_media_files(folder)
+        if not files:
+            QMessageBox.warning(self, "No Media Files",
+                                f"No audio or video files found in:\n{folder}")
+            return
+        self._load_batch_files(files, source_label=Path(folder).name, folder_path=folder)
+
+    def _load_batch_files(self, files, source_label, folder_path=None):
+        self.selected_file = None
+        self.batch_files = files
+        self.batch_folder_path = folder_path
+        n = len(files)
+        self.hdr_name.setText(f"{n} file{'s' if n != 1 else ''} queued")
+        self.hdr_sub.setText(folder_path or source_label)
+        self.hdr_meta.setText(f"Batch — {source_label}")
+        self.hdr_meta.show()
+
+        self.batch_info_label.setText(
+            f"\U0001F4E6  {n} file(s) queued from {source_label}. "
+            f"Each file's output is saved next to it, same as single-file mode."
+        )
+        self.batch_bar.setVisible(True)
+        self.status_label.setText("Ready to batch transcribe.")
+        if not self.manifest_course.text().strip():
+            self.manifest_course.setText(
+                Path(folder_path).name if folder_path else source_label
+            )
+
+    def clear_batch(self, silent=False):
+        self.batch_files = []
+        self.batch_folder_path = None
+        self.batch_bar.setVisible(False)
+        if not silent:
+            self._reset_header()
+            self.status_label.setText("Ready to transcribe")
 
     # ── Flush-header helpers ────────────────────────────────────────────────
     def _reset_header(self):
@@ -1265,6 +1844,9 @@ class VoxtextWindow(QMainWindow):
 
     def open_options(self):
         VoxtextOptionsDialog(self).exec()
+        self.manifest_panel.setVisible(bool(get_setting("translation_manifest_feature_enabled", False)))
+        if not self.manifest_panel.isVisible():
+            self.manifest_enabled.setChecked(False)
 
 
     # -----------------------------------------------------------------------
@@ -1290,15 +1872,103 @@ class VoxtextWindow(QMainWindow):
         }
 
     # -----------------------------------------------------------------------
+    # Translation Manifest panel controls (automated translation flow handoff)
+    # -----------------------------------------------------------------------
+    def toggle_manifest_options(self, state):
+        self.manifest_options.setVisible(state == Qt.CheckState.Checked.value)
+
+    def get_manifest_settings(self):
+        return {
+            'enabled':         bool(get_setting("translation_manifest_feature_enabled", False))
+                           and self.manifest_enabled.isChecked(),
+            'target_lang':     self.manifest_lang_combo.currentData(),
+            'context':         self.manifest_context.text(),
+            'course_name':     self.manifest_course.text().strip(),
+            'queue_folder':    get_setting("translation_queue_folder", "") or "",
+            'sync_root_local': get_setting("sharepoint_sync_root_local", "") or "",
+            'sync_root_sp':    get_setting("sharepoint_sync_root_path", "") or "",
+        }
+
+    def _selected_output_formats(self):
+        """
+        The output formats the user ticked — plus VTT whenever manifest
+        generation is on. Every manifest's sourceFileName points at
+        <name>_transcript.vtt, so that file has to exist even if the user
+        didn't tick VTT themselves. Still returns [] when nothing was
+        ticked, so the usual "pick a format" prompt fires first.
+        """
+        formats = [k for k, cb in self.format_checks.items() if cb.isChecked()]
+        if formats and 'vtt' not in formats and self.get_manifest_settings()['enabled']:
+            formats.append('vtt')
+        return formats
+
+    def _maybe_write_job_manifest(self, candidate_files, source_folder):
+        """
+        After a run that had manifest generation on, roll the per-video
+        manifest(s) it created into one job manifest and drop that into the
+        Job Manifest Folder — the only file that lands in the watched
+        folder itself (see ai_processor.build_job_manifest).
+        """
+        ms = self.get_manifest_settings()
+        if not ms['enabled']:
+            return
+
+        manifest_files = [f for f in candidate_files if str(f).endswith('.manifest.json')]
+        if not manifest_files:
+            return
+
+        queue_folder = ms['queue_folder']
+        if not queue_folder:
+            self.status_label.setText(
+                "Translation manifest(s) created, but no Job Manifest Folder is "
+                "set in Options — job manifest wasn't sent."
+            )
+            return
+
+        source_folder = Path(source_folder) if source_folder else None
+        course_name = ms['course_name'] or (source_folder.name if source_folder else "Voxtext")
+
+        source_folder_sp = ai_processor.sharepoint_relative_path(
+            source_folder, ms['sync_root_local'], ms['sync_root_sp']
+        ) if source_folder else None
+
+        job = ai_processor.build_job_manifest(
+            course_name, [Path(f).name for f in manifest_files], source_folder=source_folder_sp
+        )
+        job_name = f"{course_name}_{time.strftime('%Y%m%d_%H%M%S')}.job.manifest.json"
+
+        try:
+            ai_processor.write_manifest_file(job, Path(queue_folder) / job_name)
+            if source_folder_sp:
+                self.status_label.setText(
+                    f"Translation manifest(s) ready — job file sent to {Path(queue_folder).name}."
+                )
+            else:
+                self.status_label.setText(
+                    "Job manifest sent, but sourceFolder couldn't be computed — set your "
+                    "Base Cloud Folder in Options so the flow can find the per-video manifests."
+                )
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Job Manifest",
+                f"Per-video manifest(s) were created, but the job manifest couldn't "
+                f"be written to your Job Manifest Folder:\n\n{e}"
+            )
+
+    # -----------------------------------------------------------------------
     # Transcription
     # -----------------------------------------------------------------------
     def start_transcription(self):
+        if self.batch_files:
+            self.start_batch_transcription()
+            return
+
         if not self.selected_file:
             QMessageBox.warning(self, "No File", "Please select an audio or video file first."); return
         if not WHISPER_AVAILABLE:
             QMessageBox.warning(self, "Whisper Not Installed", "Please install Whisper first."); return
 
-        output_formats = [k for k, cb in self.format_checks.items() if cb.isChecked()]
+        output_formats = self._selected_output_formats()
         if not output_formats:
             QMessageBox.warning(self, "No Format", "Please select at least one output format."); return
 
@@ -1308,28 +1978,65 @@ class VoxtextWindow(QMainWindow):
         self.transcribe_btn.setEnabled(False)
         self.clear_btn.setText("Cancel")
         self.clear_btn.setStyleSheet(self._btn_danger())
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("0%")
+        self._set_progress(0, reset=True)
         self.start_time = time.time()
         self.update_elapsed_time()
 
         self.worker = TranscriptionWorker(
             self.selected_file, model_name, output_formats,
-            Path(self.selected_file).parent, self.get_lms_settings()
+            Path(self.selected_file).parent, self.get_lms_settings(),
+            self.get_manifest_settings()
         )
         self.worker.progress.connect(self.on_progress)
+        self.worker.progress_hint.connect(self.on_progress_hint)
         self.worker.finished.connect(self.on_finished)
         self.worker.error.connect(self.on_error)
         self.worker.start()
 
     def on_progress(self, message, percentage):
         self.status_label.setText(message)
-        self.progress_bar.setValue(percentage)
-        self.progress_label.setText(f"{percentage}%")
+        self._set_progress(percentage)
+
+    def on_progress_hint(self, target, step_secs):
+        """Worker expects the next real update at `target` in ~step_secs."""
+        if target <= self._prog_real:
+            return
+        # Leave a sliver of headroom so the glide visibly waits for the real
+        # update rather than parking exactly on the expected value.
+        self._prog_target = target - 0.4
+        # tau = step/3 → covers ~95% of the gap by the expected arrival, then
+        # keeps slowing if Whisper runs long on this chunk.
+        self._prog_tau = max(0.3, step_secs / 3.0)
+        if not self._prog_timer.isActive():
+            self._prog_timer.start()
+
+    def _set_progress(self, pct, reset=False):
+        """Apply a real progress value (0–100). Never moves backwards unless reset."""
+        pct = float(max(0, min(100, pct)))
+        self._prog_real = pct
+        self._prog_target = None          # wait for a fresh hint
+        if reset:
+            self._prog_display = pct
+            self._prog_timer.stop()
+        else:
+            self._prog_display = max(self._prog_display, pct)
+        if pct >= 100:
+            self._prog_timer.stop()
+        self._render_progress()
+
+    def _tick_progress(self):
+        if self._prog_target is None or self._prog_display >= self._prog_target:
+            return
+        gap = self._prog_target - self._prog_display
+        self._prog_display += gap * min(1.0, (self._prog_timer.interval() / 1000.0) / self._prog_tau)
+        self._render_progress()
+
+    def _render_progress(self):
+        self.progress_bar.setValue(int(round(self._prog_display * 10)))
+        self.progress_label.setText(f"{int(self._prog_display)}%")
 
     def on_finished(self, created_files):
-        self.progress_bar.setValue(100)
-        self.progress_label.setText("100%")
+        self._set_progress(100)
         self.status_label.setText("Transcription complete!")
         self.reset_buttons()
 
@@ -1337,13 +2044,7 @@ class VoxtextWindow(QMainWindow):
             elapsed = int(time.time() - self.start_time)
             self.elapsed_label.setText(f"Completed in {elapsed // 60}m {elapsed % 60}s")
 
-        if self.worker and getattr(self.worker, 'result', None):
-            self.last_result = self.worker.result
-            has_segs = bool(self.last_result.get('segments'))
-            self.translate_btn.setEnabled(has_segs)
-            self.format_ai_btn.setEnabled(has_segs)
-            if has_segs:
-                self.ai_note.setVisible(False)
+        self._maybe_write_job_manifest(created_files, source_folder=Path(self.selected_file).parent)
 
         files_list = "\n".join([f"• {Path(f).name}" for f in created_files])
         QMessageBox.information(
@@ -1352,13 +2053,79 @@ class VoxtextWindow(QMainWindow):
         )
 
     def on_error(self, error_msg):
-        self.progress_bar.setValue(0)
-        self.progress_label.setText("0%")
+        self._set_progress(0, reset=True)
         self.status_label.setText("Something went wrong. Please try again.")
         self.elapsed_label.setText("")
         self.reset_buttons()
         QMessageBox.critical(self, "Transcription Error",
                              f"Transcription failed:\n\n{error_msg}\n\nPlease check the file and try again.")
+
+    def start_batch_transcription(self):
+        if not WHISPER_AVAILABLE:
+            QMessageBox.warning(self, "Whisper Not Installed", "Please install Whisper first."); return
+
+        output_formats = self._selected_output_formats()
+        if not output_formats:
+            QMessageBox.warning(self, "No Format", "Please select at least one output format."); return
+
+        selected_btn = self.model_group.checkedButton()
+        model_name   = selected_btn.property("model_name") if selected_btn else "medium"
+
+        self.transcribe_btn.setEnabled(False)
+        self.clear_btn.setText("Cancel")
+        self.clear_btn.setStyleSheet(self._btn_danger())
+        self._set_progress(0, reset=True)
+        self.start_time = time.time()
+        self.update_elapsed_time()
+
+        self._batch_manifest_files = []
+
+        self.worker = BatchTranscriptionWorker(
+            self.batch_files, model_name, output_formats,
+            self.get_lms_settings(), skip_existing=self.batch_skip_existing.isChecked(),
+            manifest_settings=self.get_manifest_settings()
+        )
+        self.worker.progress.connect(self.on_progress)
+        self.worker.progress_hint.connect(self.on_progress_hint)
+        self.worker.file_finished.connect(self._on_batch_file_finished)
+        self.worker.file_failed.connect(self._on_batch_file_failed)
+        self.worker.batch_finished.connect(self.on_batch_finished)
+        self.worker.error.connect(self.on_error)
+        self.worker.start()
+
+    def _on_batch_file_finished(self, filename, created_files):
+        for f in created_files:
+            if str(f).endswith('.manifest.json'):
+                self._batch_manifest_files.append(f)
+
+    def _on_batch_file_failed(self, filename, error_msg):
+        self.status_label.setText(f"⚠ {filename} failed — continuing with the rest…")
+
+    def on_batch_finished(self, done, failed):
+        self._set_progress(100)
+        self.reset_buttons()
+
+        if self.start_time:
+            elapsed = int(time.time() - self.start_time)
+            self.elapsed_label.setText(f"Completed in {elapsed // 60}m {elapsed % 60}s")
+
+        summary = f"Done: {len(done)}   Failed: {len(failed)}"
+        self.status_label.setText(summary)
+
+        batch_source_folder = self.batch_folder_path or (
+            Path(self.batch_files[0]).parent if self.batch_files else None
+        )
+        self._maybe_write_job_manifest(self._batch_manifest_files, source_folder=batch_source_folder)
+
+        msg = f"Batch transcription complete!\n\n{summary}"
+        if failed:
+            fail_lines = "\n".join(f"• {name}: {err}" for name, err in failed[:10])
+            msg += f"\n\nFailures:\n{fail_lines}"
+            if len(failed) > 10:
+                msg += f"\n…and {len(failed) - 10} more."
+            QMessageBox.warning(self, "Batch Complete — Some Failures", msg)
+        else:
+            QMessageBox.information(self, "Batch Complete", msg)
 
     def reset_buttons(self):
         self.transcribe_btn.setEnabled(True)
@@ -1371,16 +2138,15 @@ class VoxtextWindow(QMainWindow):
             self.worker.quit()
             self.worker.wait()
             self.status_label.setText("Transcription cancelled")
-            self.progress_bar.setValue(0)
-            self.progress_label.setText("0%")
+            self._set_progress(0, reset=True)
             self.elapsed_label.setText("")
             self.reset_buttons()
         else:
             self.selected_file = None
             self._reset_header()
+            self.clear_batch(silent=True)
             self.status_label.setText("Ready to transcribe")
-            self.progress_bar.setValue(0)
-            self.progress_label.setText("0%")
+            self._set_progress(0, reset=True)
             self.elapsed_label.setText("")
 
     def update_elapsed_time(self):
@@ -1397,244 +2163,6 @@ class VoxtextWindow(QMainWindow):
             if self.timer_id:
                 self.killTimer(self.timer_id)
                 self.timer_id = None
-
-    # -----------------------------------------------------------------------
-    # Translate an externally-authored VTT file
-    # -----------------------------------------------------------------------
-    def translate_vtt_file(self):
-        """
-        Browse for an existing .vtt file, parse it into segments, then open
-        the standard AI translate dialog.  The parsed segments are stored in
-        self.last_result temporarily so open_ai_dialog can work unchanged.
-        self.selected_file is also set to the VTT path so the output file
-        lands in the same folder with a sensible name.
-        """
-        import ai_processor as ai
-
-        fp, _ = QFileDialog.getOpenFileName(
-            self, "Select WebVTT File", _start_dir(),
-            "WebVTT Files (*.vtt);;All Files (*.*)"
-        )
-        if not fp:
-            return
-
-        try:
-            segments = ai.parse_vtt_file(fp)
-        except Exception as e:
-            QMessageBox.critical(self, "Could not read VTT",
-                                 f"Failed to parse the VTT file:\n\n{e}")
-            return
-
-        # Temporarily load the VTT as the active file/result so the
-        # existing dialog path works without modification.
-        self.selected_file = fp
-        self.last_result   = {"segments": segments, "text": ""}
-
-        # Update the header so the user sees what's loaded
-        self._set_file_header(fp, note="VTT — ready to translate")
-
-        self.open_ai_dialog("translate")
-
-    # -----------------------------------------------------------------------
-    # AI dialog (clipboard round-trip)
-    # -----------------------------------------------------------------------
-    def open_ai_dialog(self, operation):
-        import ai_processor as ai
-
-        if not self.last_result or not self.last_result.get('segments'):
-            QMessageBox.warning(self, "Nothing to process",
-                                "Transcribe a file first, then translate or clean up.")
-            return
-
-        # FORMAT only writes prose formats — SRT and VTT are word-for-word
-        # timed files and must never be modified by the cleanup operation.
-        PROSE_FORMATS = {'txt', 'html', 'md'}
-        TIMED_FORMATS = {'srt', 'vtt'}
-
-        segments  = self.last_result['segments']
-        backend   = ai.ClipboardBackend()
-        lang_code = self.ai_lang_combo.currentData() if operation == "translate" else None
-        lang_name = self.ai_lang_combo.currentText() if operation == "translate" else ""
-        title     = f"Translate to {lang_name}" if operation == "translate" else "Clean Up Transcript"
-
-        # For format, figure out which prose formats are currently checked.
-        # Warn early if none are — no point building the dialog.
-        if operation == "format":
-            checked_all   = [k for k, cb in self.format_checks.items() if cb.isChecked()]
-            prose_checked = [k for k in checked_all if k in PROSE_FORMATS]
-            timed_checked = [k for k in checked_all if k in TIMED_FORMATS]
-            if not prose_checked:
-                msg = (
-                    "Clean Up works on Text, HTML, and Markdown output.\n\n"
-                    "None of those formats are currently checked.\n\n"
-                    "Check at least one prose format (TXT, HTML, or MD) and try again.\n\n"
-                    "Note: SRT and VTT are not modified by Clean Up — they preserve\n"
-                    "the original word-for-word transcript with timestamps."
-                )
-                QMessageBox.warning(self, "No prose formats selected", msg)
-                return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(title)
-        dlg.setMinimumWidth(620)
-        v = QVBoxLayout(dlg)
-        v.setContentsMargins(24, 24, 24, 24)
-        v.setSpacing(12)
-
-        # — Optional context hint ——————————————————————————————————————————
-        # Lets the user tell the agent what kind of content this is.
-        # Entirely optional — leaving it blank keeps the prompt content-neutral.
-        hint_lbl = QLabel("Content type (optional — helps the agent understand context):")
-        hint_lbl.setFont(self.f_body)
-        hint_lbl.setStyleSheet(f"color: {COLORS['text_muted']}; border: none;")
-        hint_lbl.setWordWrap(True)
-        v.addWidget(hint_lbl)
-
-        hint_input = QLineEdit()
-        hint_input.setFont(self.f_body)
-        hint_input.setStyleSheet(self._input_style())
-        hint_input.setPlaceholderText(
-            "e.g. podcast interview, lecture recording, training narration, product demo…"
-        )
-        v.addWidget(hint_input)
-
-        # — SRT/VTT notice for format operation ——————————————————————————
-        if operation == "format" and timed_checked:
-            timed_names = ", ".join(f".{f.upper()}" for f in timed_checked)
-            notice = QLabel(
-                f"ℹ  {timed_names} will not be modified — timed formats preserve the "
-                f"original word-for-word transcript. Only "
-                f"{', '.join('.' + f for f in prose_checked)} will be saved."
-            )
-            notice.setFont(self.f_small)
-            notice.setWordWrap(True)
-            notice.setStyleSheet(f"""
-                color: {COLORS['info_text']};
-                background-color: {COLORS['info_bg']};
-                border: 1px solid {COLORS['info_border']};
-                border-radius: 6px;
-                padding: 8px 12px;
-            """)
-            v.addWidget(notice)
-
-        # — Step 1 ————————————————————————————————————————————————————————
-        step1 = QLabel("Step 1 — Copy this prompt and paste it into your agent (Copilot, Claude, ChatGPT, etc.)")
-        step1.setFont(self.f_bold)
-        step1.setWordWrap(True)
-        v.addWidget(step1)
-
-        # Prompt box — rebuilt when hint changes so the prompt stays current
-        prompt_box = QTextEdit()
-        prompt_box.setReadOnly(True)
-        prompt_box.setMaximumHeight(160)
-        prompt_box.setStyleSheet(self._input_style())
-        v.addWidget(prompt_box)
-
-        copy_btn = QPushButton("Copy prompt to clipboard")
-
-        def _refresh_prompt():
-            context = hint_input.text().strip()
-            p = backend.build_outgoing(segments, operation, lang_code, context)
-            prompt_box.setPlainText(p)
-            copy_btn.setText("Copy prompt to clipboard")
-
-        hint_input.textChanged.connect(_refresh_prompt)
-        _refresh_prompt()  # populate on open
-        copy_btn.setStyleSheet(self._btn_blue())
-        copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        def do_copy():
-            QApplication.clipboard().setText(prompt_box.toPlainText())
-            copy_btn.setText("Copied ✓")
-        copy_btn.clicked.connect(do_copy)
-        v.addWidget(copy_btn)
-
-        # — Step 2 ————————————————————————————————————————————————————————
-        step2 = QLabel("Step 2 — Paste your agent's full reply below")
-        step2.setFont(self.f_bold)
-        step2.setWordWrap(True)
-        v.addWidget(step2)
-
-        reply_box = QTextEdit()
-        reply_box.setPlaceholderText("Paste the agent's response here…")
-        reply_box.setMinimumHeight(130)
-        reply_box.setStyleSheet(self._input_style())
-        v.addWidget(reply_box)
-
-        # — Buttons ———————————————————————————————————————————————————————
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.setStyleSheet(self._btn_secondary())
-        cancel_btn.clicked.connect(dlg.reject)
-        btn_row.addWidget(cancel_btn)
-
-        if operation == "translate":
-            apply_label = "Apply & Save VTT"
-        else:
-            apply_label = f"Apply & Save ({', '.join('.' + f for f in prose_checked)})"
-
-        apply_btn = QPushButton(apply_label)
-        apply_btn.setStyleSheet(self._btn_blue())
-        btn_row.addWidget(apply_btn)
-        v.addLayout(btn_row)
-
-        # — Apply logic ———————————————————————————————————————————————————
-        def do_apply():
-            pasted = reply_box.toPlainText().strip()
-            if not pasted:
-                QMessageBox.warning(dlg, "Nothing pasted", "Paste the agent's reply before applying.")
-                return
-
-            result = backend.parse_incoming(segments, pasted, operation)
-
-            # For translate, warn on segment mismatches (timing integrity check)
-            if operation == "translate" and not result.ok:
-                msg = []
-                if result.missing_ids:
-                    msg.append(f"Missing segments: {result.missing_ids} (original text kept).")
-                if result.extra_ids:
-                    msg.append(f"Unexpected segment numbers: {result.extra_ids} (ignored).")
-                proceed = QMessageBox.question(
-                    dlg, "Some segments didn't match",
-                    "\n".join(msg) + "\n\nSave anyway with these fallbacks?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if proceed != QMessageBox.StandardButton.Yes:
-                    return
-
-            base    = Path(self.selected_file).stem
-            suffix  = f"_{lang_code}" if operation == "translate" else "_cleaned"
-            out_dir = Path(self.selected_file).parent
-            writer  = TranscriptionWorker(self.selected_file, "tiny", [], out_dir, self.get_lms_settings())
-            saved   = []
-
-            if operation == "translate":
-                # Translate always writes VTT — timing is the whole point
-                out = out_dir / f"{base}{suffix}.vtt"
-                writer._write_vtt({'segments': result.segments}, out)
-                saved.append(out.name)
-            else:
-                # Format/cleanup writes prose formats only — never SRT or VTT.
-                # result.text is the cleaned prose; result.segments retain
-                # the original timings untouched (used only if JSON is added later).
-                prose_result = {'text': result.text, 'segments': result.segments}
-                prose_writers = {
-                    'txt':  lambda p: writer._write_txt(prose_result, p),
-                    'html': lambda p: writer._write_html(prose_result, p),
-                    'md':   lambda p: writer._write_markdown(prose_result, p),
-                }
-                ext_map = {'txt': '.txt', 'html': '.html', 'md': '.md'}
-                for fmt in prose_checked:
-                    out = out_dir / f"{base}{suffix}{ext_map[fmt]}"
-                    prose_writers[fmt](out)
-                    saved.append(out.name)
-
-            files_list = "\n".join(f"• {n}" for n in saved)
-            QMessageBox.information(dlg, "Saved", f"Saved:\n{files_list}\n\nin {out_dir}")
-            dlg.accept()
-
-        apply_btn.clicked.connect(do_apply)
-        dlg.exec()
 
     # -----------------------------------------------------------------------
     # Whisper installation
@@ -1780,9 +2308,13 @@ class VoxtextWindow(QMainWindow):
    Processing: roughly 2-5× the audio length
    Files saved next to your source file
 
-5. AI PROCESSING (after a transcription)
-   Clean Up: fix punctuation, remove filler words
-   Translate: convert to another language, segment timing preserved
+5. TRANSLATION MANIFEST DELIVERY (power users only)
+   Off by default — turn it on in Options if you have an automated
+   translation flow watching a cloud folder. Once enabled, check
+   "Generate Translation Manifest" on the main screen and pick a target
+   language to write a <video>.manifest.json next to each source file,
+   plus one job manifest in your Job Manifest Folder (set in Options)
+   that kicks off the flow.
 
 TIPS:
 • Your audio stays on your computer
@@ -1817,7 +2349,7 @@ REMEMBER:
 
     def show_about(self):
         QMessageBox.about(self, "About Voxtext", """<h2>Voxtext</h2>
-<p>Version 1.5</p>
+<p>Version 1.8.2</p>
 <p>Local audio &amp; video transcription, powered by OpenAI Whisper.
 Processing happens on your computer.</p>
 

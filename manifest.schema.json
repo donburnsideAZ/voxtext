@@ -1,0 +1,78 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://voxtext.local/schemas/manifest-v1.json",
+  "title": "Voxtext Translation Manifest",
+  "description": "Contract between Voxtext (writer) and an automated translation flow (reader). See MANIFEST_SCHEMA.md for the full spec and how a flow consumes it.",
+  "type": "object",
+  "required": [
+    "courseName",
+    "sourceLanguage",
+    "targetLanguage",
+    "sourceFileName",
+    "translatePrompt",
+    "segments"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "courseName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable course/batch name, from the Translation Manifest panel's course name field (falls back to the source folder name if left blank)."
+    },
+    "sourceLanguage": {
+      "type": "string",
+      "pattern": "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*$",
+      "description": "BCP-47 language code, e.g. 'en'."
+    },
+    "targetLanguage": {
+      "type": "string",
+      "pattern": "^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)*$",
+      "description": "BCP-47 language code, e.g. 'fr'."
+    },
+    "sourceFolder": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SharePoint document-library-relative path to the source folder (e.g. '/Shared Documents/Training/Onboarding'). Used as the destination folder when the flow writes the translated VTT back. Omitted if Voxtext couldn't compute it (Base cloud folder not set in Options)."
+    },
+    "sourceFileName": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The source-language VTT transcript Voxtext writes alongside the video: '<video_id>_transcript.vtt'."
+    },
+    "translatePrompt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Segment-tagged wire text, one '[[id]] text' line per segment, newline-joined. In the source language, and it contains no instructions, only the text. Pre-built by Voxtext so the flow does not need its own compose step -- feed this directly to your translation step. When the Context Hint field is set, a leading 'Content context: <hint>' line plus a blank line is prepended -- register/terminology guidance only, not tagged, omitted entirely when the hint is blank."
+    },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "start",
+          "end"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-based, sequential, matches translatePrompt's [[id]] tags. Stable across the translate round-trip."
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^\\d{2}:\\d{2}:\\d{2}\\.\\d{3}$",
+            "description": "HH:MM:SS.mmm, zero-padded, '.' separator -- Voxtext's exact VTT timestamp format. Copy verbatim into the output VTT cue."
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^\\d{2}:\\d{2}:\\d{2}\\.\\d{3}$",
+            "description": "HH:MM:SS.mmm, same format as start. Must be >= start."
+          }
+        }
+      }
+    }
+  }
+}
