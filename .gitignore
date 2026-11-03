@@ -34,3 +34,44 @@ Thumbs.db
 *.sqlite
 *.db
 
+
+# --- Added 2026-11-03: keep binaries, builds and local-only files out of GitHub ---
+
+# TPC per-machine folders (snapshots are TPC's own history; configs are machine-specific)
+.tpc*/
+
+# Bundled tools and binaries (ffmpeg is downloaded/bundled at build time)
+ffmpeg*/
+*.exe
+*.dll
+*.dylib
+*.dmg
+*.pkg
+*.app/
+Installers/
+
+# Old dated source zips and backups (git is the backup now)
+*.zip
+*.tar.gz
+*.bak
+*.py.before-*
+
+# Test media and transcription outputs
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.mov
+*.vtt
+*.srt
+
+# Whisper / AI model files
+*.pt
+*.bin
+*.gguf
+*.onnx
+models/
+
+# Sync tool leftovers
+*.sync-conflict-*
+.stfolder/
